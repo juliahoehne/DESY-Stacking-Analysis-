@@ -7,7 +7,7 @@ in order to formulate the llh. When you create the llh and subsequently the TS, 
 minimize the TS wrt the number of signal events n_s, in order to find the best-fit ns.
 You do this many times to find the TS distribution,
 each time with a different dataset (background RA are randomly selected each time)
- 
+
 For this energy bin, you first simulate the background events n_bkg,
 for 2 different spectral indices and a uniform RA & DEC. For the same energy range,
 you also simulate the signal events n_sig: for a source at a given position that is drawn from
@@ -22,15 +22,14 @@ calculate the pdfs in the llh. You then minimize the llh with respect to the sig
 
 """
 
+import os, argparse, ast, pickle
 import numpy as np
 import numpy.typing as npt
+from typing import Tuple, Optional, List, Union, Callable
 
-from typing import Tuple, Optional, List, Mapping, Union
+from scipy.optimize import minimize
 
 import matplotlib.pyplot as plt
-
-# from scipy.optimize import curve_fit
-import pandas as pd
 
 
 class SimulateSources:
@@ -373,7 +372,30 @@ class LLH:
         self.src_pos = srcs.src_positions
 
     @staticmethod
+    def opening_angles(
+        src_dec: float, src_ra: float, data_dec: float, data_ra: float
+    ) -> float:
+        """Function for calculating the angular distance
+        between the source & event positions, both in DEC, RA
+
+        Args:
+            src_dec (float): source declination (in rad)
+            src_ra (float): source right ascention (in rad)
+            data_dec (float): event declination (in rad)
+            data_ra (float): event right ascention (in rad)
+
+        Returns:
+            float: the opening angle (in rad)
+        """
+
+        oa = np.arccos(
+            np.sin(src_dec) * np.sin(data_dec)
+            + np.cos(src_dec) * np.cos(data_dec) * np.cos(src_ra - data_ra)
+        )
+        return oa
+
     def compute_opening_angles_per_src(
+        self,
         src_pos: Tuple[float, float],
         data_pos: List[Tuple[float, float]],
     ) -> npt.NDArray:
@@ -393,10 +415,7 @@ class LLH:
         for i, pos in enumerate(data_pos):
             data_dec = pos[0]
             data_ra = pos[1]
-            op_angles[i] = np.arccos(
-                np.sin(src_dec) * np.sin(data_dec)
-                + np.cos(src_dec) * np.cos(data_dec) * np.cos(src_ra - data_ra)
-            )
+            op_angles[i] = self.opening_angles(src_dec, src_ra, data_dec, data_ra)
         return op_angles
 
     def spatial_pdf(self, opening_angles: npt.NDArray) -> npt.NDArray:
@@ -414,7 +433,7 @@ class LLH:
             -(opening_angles**2) / (2 * self.ang_err**2)
         )
 
-    def create_ts_per_bin(self, n_s: float, data: npt.ArrayLike) -> float:
+    def calculate_ts_per_bin(self, n_s: float, data_per_bin: npt.ArrayLike) -> float:
         """Construct the TS function per energy bin.
 
         First calculate the opening angles per source wrt
@@ -439,18 +458,18 @@ class LLH:
             float: the TS value for a given ns in a given energy bin
         """
 
-        N = len(data)
+        N = len(data_per_bin)
         llh_vals = []
-        for i, src in enumerate(self.src_pos):
+        for src in self.src_pos:
             # compute array per src, each element of the array
             # is the opening angle wrt each event in data
-            opening_angles = self.compute_opening_angles_per_src(src, data)
+            opening_angles = self.compute_opening_angles_per_src(src, data_per_bin)
             # compute signal spatial pdf for each src using data
             sig_spatial = self.spatial_pdf(opening_angles)
-            print("sig spatial before mask ", sig_spatial)
+            # print("sig spatial before mask ", sig_spatial)
             sig_spatial_mask = sig_spatial > self.sig_spatial_threshold
             sig_spatial = sig_spatial[sig_spatial_mask]
-            print("sig spatial after mask ", sig_spatial)
+            # print("sig spatial after mask ", sig_spatial)
 
             # calculate llh value for each src and all the data
             # bkg spatial pdf = 1/4*pi
@@ -461,21 +480,248 @@ class LLH:
         return 2.0 * np.sum(llh_vals)
 
 
-srcs = SimulateSources(2)
-data = SimulateDataset(src_pop=srcs, smax=5.0, identical=True, n_atm=10, e_bins=3)
-print("sig events = ", data.all_sig_events_per_bin)
-print("all astro bkg events = ", data.n_astro)
-print("expected astro bkg events per bin", data.astro_events_per_bin)
-print("expected atm bkg events per bin:", data.atm_events_per_bin)
-print("data for 1st bin: ", len(data.dataset[0]))
-llh = LLH(data, srcs)
-src_pos = srcs.src_positions[0]
-print("src position: ", src_pos)
-data_pos_first_bin = data.dataset[0]
-oa = llh.compute_opening_angles_per_src(src_pos, data_pos_first_bin)
-print("opening angles for data in 1st energy bin: ", oa)
-print("ang error (rad) = ", llh.ang_err)
-spatial_pdf = llh.spatial_pdf(oa)
-print("sig pdf vals: ", spatial_pdf)
-ts_1st_bin = llh.create_ts_per_bin(1.0, data_pos_first_bin)
-print("for ns = 1 & 1st energy bin, TS = ", ts_1st_bin)
+class Analysis:
+    """Perform the analysis once, to get the best-fit
+    number of signal events ns and the corresponding TS value.
+    The minimization is done per energy bin, where you fit
+    the ns to the data in that energy bin, and subsequently
+    calculate the TS for that best-fit value.
+    For the full energy range, you just add the best-fit values.
+    If the best-fit TS is negative, set it to 0 but flag it first.
+
+    Args:
+        llh (LLH): instance of the llh function
+        init_ns (float, optional): initial guess for the ns.
+            Passed in the minimizer as an array. Defaults to 1.0.
+        ns_bounds (Tuple[float, float], optional): bounds for the ns
+            Passed in the minimizer as an array. Defaults to (0, 1000).
+    """
+
+    def __init__(
+        self,
+        llh: LLH,
+        init_ns: float = 1.0,
+        ns_bounds: Tuple[float, float] = (0, 1e3),
+    ) -> None:
+
+        self.llh = llh
+        self.start_seed = init_ns
+        self.bounds = ns_bounds
+
+        self.dataset = llh.data_pos
+        self.srcs = llh.src_pos
+
+    def minimize_llh_func(
+        self, data: npt.ArrayLike
+    ) -> Tuple[Optional[npt.NDArray], Optional[float]]:
+        """Minimize the llh function wrt ns.
+        First make the function by constructing
+        the TS as a function of ns for given data (per bin),
+        and then minimize it with the provided
+        initial guess and bounds for the ns.
+
+        Args:
+            data (npt.ArrayLike): the events positions in an energy bin
+
+        Returns:
+            (best_fit_ns, best_ts). If minimization is successful,
+                minimizer returns best-fit value as numpy array, and
+                for that best-fit ns the TS is calculated.
+                If not successful, both are None
+        """
+
+        def llh_func(ns: npt.NDArray) -> Callable:
+            """Function to minimize
+            The ns parameter should be a numpy array
+            to conform with the scipy minimize requirements.
+            Returns (- TS function) because you want to
+            minimize it (instead of maximizing the TS function)
+
+            Args:
+                ns (npt.NDArray): number of signal events
+
+            Returns:
+                -TS function for given data and ns as free parameter
+            """
+            n_s = ns[0]
+            return self.llh.calculate_ts_per_bin(n_s, data)
+
+        result = minimize(llh_func, [self.start_seed], bounds=[self.bounds])
+        if result.success:  # if minimization is successful
+            best_fit_ns = result.x  # array with best-fit ns
+            best_ts = llh_func(best_fit_ns)
+            if best_ts < 0 or best_ts == -0.0:
+                best_ts = 0.0
+        else:
+            best_fit_ns, best_ts = None, None
+
+        return best_fit_ns, best_ts
+
+    def find_total_ns(self) -> Tuple[float, float]:
+        """Get best-fit ns and TS values
+        for the full energy range
+
+        Returns:
+            Tuple[float, float]: (total ns, total TS)
+        """
+        ts = 0
+        ns = 0
+        for data in self.dataset:
+            ns_per_bin, ts_per_bin = self.minimize_llh_func(data)
+            if ns_per_bin is not None and ts_per_bin is not None:
+                ns += np.sum(ns_per_bin)
+                ts += ts_per_bin
+            else:
+                raise ValueError("Minimization went wrong, abort mission")
+
+        return ns, ts
+
+
+if __name__ == "__main__":
+    # configure how you run the script
+    parser = argparse.ArgumentParser()
+
+    # make the arguments with which to run the script
+    parser.add_argument(
+        "-nsrcs",
+        type=int,
+        required=True,
+        help="Number of sources to simulate",
+    )
+    parser.add_argument(
+        "-dec_band",
+        type=float,
+        help="The declination band (in deg) for which the source positions are simulated. Default is +-60deg",
+        default=60,
+    )
+    parser.add_argument(
+        "-smax",
+        type=float,
+        help="The maximum number of neutrinos for the brightest source in the population. Default is 5",
+        default=5.0,
+    )
+    parser.add_argument(
+        "-identical_fluxes",
+        type=ast.literal_eval,
+        help="Whether or not the sources have identical neutrino fluxes. Default is False",
+        default=False,
+    )
+    parser.add_argument(
+        "-flux_index",
+        type=float,
+        help="The index for the sources' flux distribution. Default is -2.5, corresponding to S^(-5/2) distribution",
+        default=-2.5,
+    )
+    parser.add_argument(
+        "-gamma",
+        type=float,
+        help="The spectral index for the power-law neutrino spectrum. Default is -1.9, corresponding to the standard E^(-2) production",
+        default=-1.9,
+    )
+    parser.add_argument(
+        "-natm",
+        type=int,
+        required=True,
+        help="Number of atmospheric background events to simulate",
+    )
+    parser.add_argument(
+        "-astro_fraction",
+        type=float,
+        help="The fraction of signal to astrophysical background events. Default is 20%",
+        default=0.2,
+    )
+    parser.add_argument(
+        "-gamma_bkg",
+        type=Tuple[float, float],
+        help="The spectral indices for the atmospheric and astrophysical background fluxes respectively. Default is (-3., -1.9)",
+        default=(-3.0, -1.9),
+    )
+    parser.add_argument(
+        "-min_e",
+        type=float,
+        help="Minimum energy as in power of 10 (in GeV). Default is 3, corresponding to 10^3 GeV = 1 TeV",
+        default=3.0,
+    )
+    parser.add_argument(
+        "-max_e",
+        type=float,
+        help="Maximum energy as in power of 10 (in GeV). Default is 6, corresponding to 10^6 GeV = 1 PeV",
+        default=6.0,
+    )
+    parser.add_argument(
+        "-bins",
+        type=int,
+        help="Number of energy bins. Default is 1, corresponding to the full energy range [10**min_e, 10**max_e]",
+        default=1,
+    )
+    parser.add_argument(
+        "-ang_err",
+        type=float,
+        help="The angular error (in deg). Default is 0.8, corresponding to the median value from the 10y NT MC",
+        default=0.8,
+    )
+    parser.add_argument(
+        "-sig_spat_thresh",
+        type=float,
+        help="Threshold for the signal spatial pdf, above which the event is counted as signal. Default is 10^(-21)",
+        default=1e-21,
+    )
+    parser.add_argument(
+        "-ns_seed",
+        type=float,
+        help="Initial guess for the ns passed in the minimizer. Default is 1",
+        default=1.0,
+    )
+    parser.add_argument(
+        "-ns_bounds",
+        type=Tuple[float, float],
+        help="Bounds for the ns passed in the minimizer. Default is (0, 1000)",
+        default=(0.0, 1e3),
+    )
+    parser.add_argument(
+        "-ntrials",
+        type=int,
+        help="Number of trials to perform. Default is 1",
+        default=1,
+    )
+    parser.add_argument(
+        "-save_path",
+        type=str,
+        required=True,
+        help="Path where you want to save the results",
+    )
+
+    args = parser.parse_args()
+
+    # simulate the srcs outside the loop so their positions don't change
+    srcs = SimulateSources(
+        nsources=args.nsrcs, min_dec=-args.dec_band, max_dec=args.dec_band
+    )
+    all_ns, all_TS = [], []
+    for _ in range(args.ntrials):
+        # for each trial make new dataset
+        data = SimulateDataset(
+            src_pop=srcs,
+            smax=args.smax,
+            identical=args.identical_fluxes,
+            n_atm=args.natm,
+            astro_fraction=args.astro_fraction,
+            gamma=args.gamma,
+            dnds_index=args.flux_index,
+            gamma_bkg=args.gamma_bkg,
+            min_e=args.min_e,
+            max_e=args.max_e,
+            e_bins=args.bins,
+        )
+
+        # perform analysis for this dataset
+        llh = LLH(data, srcs)
+        ana = Analysis(llh)
+        ns, ts = ana.find_total_ns()
+        all_ns.append(ns)
+        all_TS.append(ts)
+
+    # save results in a pickle file at the provided path
+    filepath = os.path.join(args.save_path, "results.pkl")
+    with open(filepath, "wb") as f:
+        pickle.dump([all_ns, all_TS], f)
