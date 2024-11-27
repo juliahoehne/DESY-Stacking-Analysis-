@@ -23,11 +23,13 @@ calculate the pdfs in the llh. You then minimize the llh with respect to the sig
 """
 
 import os, argparse, ast, pickle
+import healpy as hp
 import numpy as np
 import numpy.typing as npt
 from typing import Tuple, Optional, List, Union, Callable
 
 from scipy.optimize import minimize
+from scipy.stats import norm
 
 import matplotlib.pyplot as plt
 
@@ -79,29 +81,39 @@ class SimulateSources:
 class SimulateDataset:
     """
     Simulate the dataset containing signal and background events.
-    The positions of all the events are randomly distributed,
-    but their energies follow different power laws.
+    The number of expected events are calculated wrt their
+    power-law distributions for each energy bin,
+    so that the number of simulated events are drawn from
+    a Poisson distribution around the expectation value.
+    The simulated dataset consists of the events positions in (RA, DEC)
+    for each energy bin.
 
     For the background, atmospheric events follow a softer spectrum,
     ie index ~ 3, while astrophysical a harder one, ie index ~ 2.
-    You get the number of background events per energy bin
-    from the respective fluxes according to the 2 different spectral assumptions.
-    For the astrophysical background, the number of events is defined such as
-    the signal events amount to a given fraction of the
-    astrophysical background events. This is to avoid having to take into account
-    the background when signal events is too high.
+    You get the expected number of background events per energy bin
+    from the respective spectra. The normalization of the spectra is wrt
+    the total number of events (ie for all energy bins) you want to simulate.
+    For the atmospheric background, this is the n_atmo parameter.
+    For the astrophysical background, the total number of events is defined
+    such as the signal events amount to a given fraction of the
+    astrophysical background events. This is to avoid having
+    to take into account the background when signal is too high.
+    The positions of all background events are randomly drawn from a
+    uniform distribution, with the DEC being constrained to the band
+    defined when simulating the sources.
 
-    Signal events have energies that follow a hard spectrum as well,
-    but their positions are constrained in a box around the source positions.
-    The number of signal events is defined by the flux of the sources:
-    their neutrino fluxes are distributed according to a S**a power law,
-    and you can select if all the sources have identical fluxes, or
-    they are assigned randomly per source.
-
-    For both background and signal events you add Poisson noise
-    in the number of events you got from the fluxes, so by adding them you get the
-    total number of events in the dataset.
-
+    The expected number of all signal events per source is calculated wrt
+    a S**a power law, and you can select if all the sources
+    have identical fluxes, or they are assigned randomly per source.
+    Signal events also follow a hard spectrum, wrt which you estimate
+    the expected number of signal events per energy bin per source,
+    with the normalization of the spectrum done wrt the total number
+    of expected events per source (ie you normalize per source).
+    To simulate the signal events, we draw from a Poisson distribution
+    around the expected number of events per energy bin.
+    Their positions are simulated by first drawing from a Gaussian
+    (shifted by the angular reconstruction error) for the events (RA, DEC)
+    and a mock true (RA, DEC), which is then rotated to match the source position
 
     Args:
         src_pop (SimulateSources): the simulated source population
@@ -110,30 +122,35 @@ class SimulateDataset:
                 Used to define the number of astrophysical background events
                 wrt to the number of signal events you get for given nsources.
                 Default is 0.2, so all signal events amount to 20% of the astrophysical background
-        identical (bool): if you want to simulate a population where all the sources
-                have identical neutrino fluxes
+        identical (bool): if you want to simulate a population
+                where all the sources have identical neutrino fluxes. Default is False
         smax (float): maximum neutrino flux in the population.
-                Corresponds to the flux (here number of neutrinos) the brightest
-                source in the population has
-        gamma (float, optional): The spectral index for the neutrino production model.
-                Assume that all sources in the population produce neutrinos according to
-                E**gamma power law, where E is the neutrino energy.
+                Corresponds to the flux (here number of neutrinos)
+                the brightest source in the population has. Default is 5
+        gamma (float, optional): spectral index for neutrino production model.
+                Assume that all sources in the population produce neutrinos
+                according to E**gamma power law, where E is the neutrino energy.
                 Defaults to -1.9 for standard E^(-2) power law
-        dnds_index (float, optional): The index for the neutrino flux distribution.
+        dnds_index (float, optional): index for the sources neutrino flux distribution.
                 Defaults to -2.5 for an S^(-5/2) distribution.
-        gamma_bkg (Tuple[float, float], optional): spectral indices for (atmospheric, astrophysical) background fluxes,
+        gamma_bkg (Tuple[float, float], optional): spectral indices for (atmospheric, astrophysical) background fluxes.
                 Default is (-3, -1.9)
-        min_e (float, optional): minimum energy in power of 10 and units of GeV. Default 3 (ie 10^3 GeV = 1 TeV)
-        max_e (float, optional): maximum energy in power of 10 and units of GeV. Default is 6 (ie 10^6 GeV = 1 PeV)
-        e_bins (int, optional): number of bins in [min_e, max_e] energy range. Default is 1 (ie full energy range)
+        min_e (float, optional): minimum energy in power of 10 and units of GeV.
+                Default 3 (ie 10^3 GeV = 1 TeV)
+        max_e (float, optional): maximum energy in power of 10 and units of GeV.
+                Default is 6 (ie 10^6 GeV = 1 PeV)
+        e_bins (int, optional): number of bins in [min_e, max_e] energy range.
+                Default is 1 (ie full energy range)
+        ang_error (float, optional): angular error in deg.
+                Defaults to 0.8deg, which is the median value from the 10y NT MC (nt_v005_p01)
     """
 
     def __init__(
         self,
         src_pop: SimulateSources,
-        smax: float,
-        identical: bool,
         n_atm: int,
+        smax: float = 5,
+        identical: bool = False,
         astro_fraction: float = 0.2,
         gamma: float = -1.9,
         dnds_index: float = -2.5,
@@ -141,13 +158,17 @@ class SimulateDataset:
         min_e: float = 3.0,
         max_e: float = 6.0,
         e_bins: int = 1,
+        ang_error: float = 0.8,
+        bkg_only: bool = False,
     ) -> None:
 
+        self.srcs = src_pop
         self.nsrcs = src_pop.nsrcs
         self.n_atm = n_atm
         self.astro_fraction = astro_fraction
         self.min_dec = src_pop.min_dec
         self.max_dec = src_pop.max_dec
+        self.angular_error = ang_error
         self.Smax = smax
         self.identical_flux = identical
         self.gamma = gamma
@@ -165,16 +186,120 @@ class SimulateDataset:
         self.simulate_bkg_events()
         self.dataset = []
         for i in range(self.nbins):
-            tot_events_per_bin = self.bkg_pos[i] + self.sig_pos[i]
-            self.dataset.append(tot_events_per_bin)
+            if not bkg_only:
+                tot_events_per_bin = self.bkg_pos[i] + self.sig_pos[i]
+                self.dataset.append(tot_events_per_bin)
+            else:
+                tot_events_per_bin = self.bkg_pos[i]
+                self.dataset.append(tot_events_per_bin)
+
+    def rotate_position(
+        self,
+        ra1: float,
+        dec1: float,
+        ra2: float,
+        dec2: float,
+        ra3: float,
+        dec3: float,
+    ) -> Tuple[float, float]:
+        """
+        Rotate event position with reconstructed (ra1, dec1) and true (ra2, dec2)
+        in a way that true position exactly maps onto source position (ra3, dec3),
+        as if it was originally incident on the source (ie true position = source position).
+        All angles are treated as radians.
+
+        Args:
+            ra1 (float): events RA
+            dec1 (float): events DEC
+            ra2 (float): events true RA
+            dec2 (float): events true DEC
+            ra3 (float): source Right Ascension
+            dec3 (float): source Declination
+
+        Returns:
+            (float, float) new RA and Dec for the event
+        """
+
+        # Turns Right Ascension/Declination into Azimuth/Zenith for healpy
+        phi1 = ra1 - np.pi
+        zen1 = np.pi / 2.0 - dec1
+        phi2 = ra2 - np.pi
+        zen2 = np.pi / 2.0 - dec2
+        phi3 = ra3 - np.pi
+        zen3 = np.pi / 2.0 - dec3
+
+        # Rotate ra1 and dec1 towards the pole?
+        rot_matrix = hp.rotator.get_rotation_matrix((phi2, -zen2, 0.0))[0]
+        x = hp.rotator.rotateDirection(rot_matrix, zen1, phi1)
+
+        # Rotate towards ra3, dec3
+        rot_pos = hp.rotator.rotateDirection(
+            np.dot(
+                hp.rotator.get_rotation_matrix((-phi3, 0, 0))[0],
+                hp.rotator.get_rotation_matrix((0, zen3, 0.0))[0],
+            ),
+            x[0],
+            x[1],
+        )
+
+        dec = np.pi / 2.0 - rot_pos[0]  # rot_pos[0] = zenith
+        ra = rot_pos[1] + np.pi  # rot_pos[1] = azimuth
+
+        return ra, dec
+
+    def simulate_sig_events_pos(
+        self, n_events: int, src_ra: float, src_dec: float
+    ) -> List[Tuple[float, float]]:
+        """
+        Simulate positions for the signal events.
+        First create the events RA & DEC (in rad) by randomly
+        drawing from a Gaussian distribution with
+        mean = 0 & std = 1, which we shift by the
+        angular error (ie make angular error the distributions std).
+        For the simulated RA we also add pi.
+        The true events positions are also simulated
+        to be pi and 0 for the RA, DEC respectively.
+        Using these we rotate the events positions
+        to match the source ones.
+        Return a list of tuples containing the
+        new (DEC, RA) for each event
+
+        Args:
+            n_events (int): number of signal events
+            src_ra (float): the sources RA
+            src_dec (float): the sources DEC
+
+        Returns:
+            [(float, float)]: list of n_events (DEC, RA)
+        """
+
+        sim_ra = np.pi + norm.rvs(size=n_events) * self.angular_error
+        sim_dec = norm.rvs(size=n_events) * self.angular_error
+        true_ra = np.ones_like(sim_dec) * np.pi
+        true_dec = np.zeros_like(sim_dec)
+
+        sig_events_pos = []
+        for i in range(n_events):
+            new_ra, new_dec = self.rotate_position(
+                ra1=sim_ra[i],
+                dec1=sim_dec[i],
+                ra2=true_ra[i],
+                dec2=true_dec[i],
+                ra3=src_ra,
+                dec3=src_dec,
+            )
+            sig_events_pos.append((new_dec, new_ra))
+
+        return sig_events_pos
 
     def flux_distribution(
         self, nsources: Union[int, npt.NDArray]
     ) -> Union[int, npt.NDArray]:
         """The S**a flux distribution for the source population,
-        parametrized in terms of number of neutrinos * number of sources
-        and normalized to the number of neutrinos Smax
-        for the brightest source in the population
+        in terms of number of neutrinos. It's parametrized
+        as the number of neutrinos Smax for the brightest source
+        in the population * number of sources
+
 
         Args:
             nsources (int | numpy array): number of sources
@@ -231,18 +356,25 @@ class SimulateDataset:
 
         # self.all_sig_events_per_src = self.sig_events_per_bin.sum(1)
 
-        # simulate DEC & RA for all signal events per energy bin
+        # simulate signal events positions as in (DEC, RA)
         self.all_sig_events_per_bin = self.sig_events_per_bin.sum(0)
         self.sig_pos = []
         for i in range(self.nbins):
-            # simulate positions as (DEC, RA)
-            sig_pos_per_bin = [
-                (
-                    np.deg2rad(np.random.uniform(self.min_dec, self.max_dec)),
-                    np.deg2rad(np.random.uniform(0, 360)),
+            sig_pos_per_bin = []
+            for n in range(self.nsrcs):
+                # for each src get the number of signal events per bin
+                sig_per_src_per_bin = self.sig_events_per_bin[n][i]
+                # get the src position
+                src_dec, src_ra = (
+                    self.srcs.src_positions[n][0],
+                    self.srcs.src_positions[n][1],
                 )
-                for _ in range(int(self.all_sig_events_per_bin[i]))
-            ]
+                # simulate (DEC, RA) for all signal events per src per bin
+                sig_pos_per_src_per_bin = self.simulate_sig_events_pos(
+                    int(sig_per_src_per_bin), src_ra, src_dec
+                )
+
+                sig_pos_per_bin.extend(sig_pos_per_src_per_bin)
             self.sig_pos.append(sig_pos_per_bin)
 
     def simulate_bkg_events(self) -> None:
@@ -347,9 +479,6 @@ class LLH:
     Args:
         data (SimulateDataset): instance of the simulated dataset
         srcs (SimulateSources): instance of the simulated source population
-        ang_error (float, optional): angular error in deg.
-            Defaults to 0.8deg, which is the median value from the 10y NT MC
-            (nt_v005_p01)
         sig_spatial_threshold (float, optional): threshold value for the
             signal spatial pdf. Used to get rid of very small values
             that will not contribute to the llh. Defaults to 1e-21
