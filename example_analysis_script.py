@@ -93,11 +93,13 @@ class SimulateDataset:
     You get the expected number of background events per energy bin
     from the respective spectra. The normalization of the spectra is wrt
     the total number of events (ie for all energy bins) you want to simulate.
-    For the atmospheric background, this is the n_atmo parameter.
     For the astrophysical background, the total number of events is defined
     such as the signal events amount to a given fraction of the
     astrophysical background events. This is to avoid having
     to take into account the background when signal is too high.
+    The atmospheric background events are calculated by subtracting
+    the number of signal and astrophysical background events
+    from the total number of events N that ypu specify.
     The positions of all background events are randomly drawn from a
     uniform distribution, with the DEC being constrained to the band
     defined when simulating the sources.
@@ -117,7 +119,7 @@ class SimulateDataset:
 
     Args:
         src_pop (SimulateSources): the simulated source population
-        n_atmo (int): number of background atmospheric events
+        ntotal (int): number of total events in the dataset
         astro_fraction (float): fraction of signal to astrophysical background
                 Used to define the number of astrophysical background events
                 wrt to the number of signal events you get for given nsources.
@@ -148,7 +150,7 @@ class SimulateDataset:
     def __init__(
         self,
         src_pop: SimulateSources,
-        n_atm: int,
+        ntotal: int,
         smax: float = 5,
         identical: bool = False,
         astro_fraction: float = 0.2,
@@ -164,11 +166,11 @@ class SimulateDataset:
 
         self.srcs = src_pop
         self.nsrcs = src_pop.nsrcs
-        self.n_atm = n_atm
-        self.astro_fraction = astro_fraction
+        self.n = ntotal
+        self.f_astro = astro_fraction
         self.min_dec = src_pop.min_dec
         self.max_dec = src_pop.max_dec
-        self.angular_error = ang_error
+        self.angular_error = np.deg2rad(ang_error)
         self.Smax = smax
         self.identical_flux = identical
         self.gamma = gamma
@@ -395,7 +397,8 @@ class SimulateDataset:
 
         # total number of astrophysical background events wrt to
         # the total number of signal events (ie for all sources & all energy bins)
-        self.n_astro = int(sum(self.all_sig_events_per_bin) / self.astro_fraction)
+        self.n_astro = int(sum(self.all_sig_events_per_bin) / self.f_astro)
+        self.n_atm = self.n - self.n_astro - sum(self.all_sig_events_per_bin)
 
         # calculate number of bkg events per energy bin
         self.atm_events_per_bin = np.zeros(len(self.energy_bins) - 1)
@@ -562,7 +565,9 @@ class LLH:
             -(opening_angles**2) / (2 * self.ang_err**2)
         )
 
-    def calculate_ts_per_bin(self, n_s: float, data_per_bin: npt.ArrayLike) -> float:
+    def calculate_ts_per_bin(
+        self, ns_frac: float, data_per_bin: npt.ArrayLike
+    ) -> float:
         """Construct the TS function per energy bin.
 
         First calculate the opening angles per source wrt
@@ -571,9 +576,13 @@ class LLH:
         ones that are above a threshold value, since
         for values below the event won't contribute to the llh.
 
-        Construct the function with the n_s as free parameter,
-        this is the number of signal neutrinos you inject each time and
-        let it vary until you find the best-fit value.
+        Construct the function with the ns_frac as free parameter.
+        This is the fraction of ns/N, where ns is the
+        number of signal neutrinos you inject each time and
+        N is the total number of events you have in the bin.
+        We choose to fit the fraction instead of ns, because
+        we can easily constrain it to 0-1 in the minimizer,
+        and thus avoid having negative llh values when fitted ns is > N.
         You sum the log of the expression to get the sum over all events,
         basically get the llh for each source, and then sum again
         to get the TS value for all sources
@@ -587,7 +596,6 @@ class LLH:
             float: the TS value for a given ns in a given energy bin
         """
 
-        N = len(data_per_bin)
         llh_vals = []
         for src in self.src_pos:
             # compute array per src, each element of the array
@@ -595,14 +603,12 @@ class LLH:
             opening_angles = self.compute_opening_angles_per_src(src, data_per_bin)
             # compute signal spatial pdf for each src using data
             sig_spatial = self.spatial_pdf(opening_angles)
-            # print("sig spatial before mask ", sig_spatial)
             sig_spatial_mask = sig_spatial > self.sig_spatial_threshold
             sig_spatial = sig_spatial[sig_spatial_mask]
-            # print("sig spatial after mask ", sig_spatial)
 
             # calculate llh value for each src and all the data
             # bkg spatial pdf = 1/4*pi
-            llh_value = 1 + (n_s / N) * (4 * np.pi * sig_spatial - 1.0)
+            llh_value = 1 + ns_frac * (4 * np.pi * sig_spatial - 1.0)
             llh_per_src = np.sum(np.log(llh_value))
             llh_vals.append(llh_per_src)
 
@@ -630,12 +636,10 @@ class Analysis:
         self,
         llh: LLH,
         init_ns: float = 1.0,
-        ns_bounds: Tuple[float, float] = (0, 1e3),
     ) -> None:
 
         self.llh = llh
         self.start_seed = init_ns
-        self.bounds = ns_bounds
 
         self.dataset = llh.data_pos
         self.srcs = llh.src_pos
@@ -643,11 +647,11 @@ class Analysis:
     def minimize_llh_func(
         self, data: npt.ArrayLike
     ) -> Tuple[Optional[npt.NDArray], Optional[float]]:
-        """Minimize the llh function wrt ns.
+        """Minimize the llh function wrt ns/N.
         First make the function by constructing
-        the TS as a function of ns for given data (per bin),
-        and then minimize it with the provided
-        initial guess and bounds for the ns.
+        the TS as a function of ns/N for given N data (per bin),
+        and then minimize it with the provided initial guess.
+        The minimization bounds are set to (0,1) for the ns/N.
 
         Args:
             data (npt.ArrayLike): the events positions in an energy bin
@@ -675,16 +679,16 @@ class Analysis:
             n_s = ns[0]
             return self.llh.calculate_ts_per_bin(n_s, data)
 
-        result = minimize(llh_func, [self.start_seed], bounds=[self.bounds])
+        result = minimize(llh_func, [self.start_seed / len(data)], bounds=[(0, 1)])
         if result.success:  # if minimization is successful
-            best_fit_ns = result.x  # array with best-fit ns
-            best_ts = llh_func(best_fit_ns)
+            best_fit_frac_ns = result.x  # array with best-fit ns
+            best_ts = llh_func(best_fit_frac_ns)
             if best_ts < 0 or best_ts == -0.0:
                 best_ts = 0.0
         else:
-            best_fit_ns, best_ts = None, None
+            best_fit_frac_ns, best_ts = None, None
 
-        return best_fit_ns, best_ts
+        return best_fit_frac_ns, best_ts
 
     def find_total_ns(self) -> Tuple[float, float]:
         """Get best-fit ns and TS values
@@ -695,10 +699,13 @@ class Analysis:
         """
         ts = 0
         ns = 0
-        for data in self.dataset:
-            ns_per_bin, ts_per_bin = self.minimize_llh_func(data)
-            if ns_per_bin is not None and ts_per_bin is not None:
-                ns += np.sum(ns_per_bin)
+        for i, data in enumerate(self.dataset):
+            if len(data) == 0:
+                continue
+            else:
+                frac_ns_per_bin, ts_per_bin = self.minimize_llh_func(data)
+            if frac_ns_per_bin is not None and ts_per_bin is not None:
+                ns += np.sum(frac_ns_per_bin * len(data))
                 ts += ts_per_bin
             else:
                 raise ValueError("Minimization went wrong, abort mission")
@@ -716,6 +723,12 @@ if __name__ == "__main__":
         type=int,
         required=True,
         help="Number of sources to simulate",
+    )
+    parser.add_argument(
+        "-N",
+        type=int,
+        required=True,
+        help="Total number of events in the dataset",
     )
     parser.add_argument(
         "-dec_band",
@@ -748,13 +761,7 @@ if __name__ == "__main__":
         default=-1.9,
     )
     parser.add_argument(
-        "-natm",
-        type=int,
-        required=True,
-        help="Number of atmospheric background events to simulate",
-    )
-    parser.add_argument(
-        "-astro_fraction",
+        "-fastro",
         type=float,
         help="The fraction of signal to astrophysical background events. Default is 20%",
         default=0.2,
@@ -784,7 +791,7 @@ if __name__ == "__main__":
         default=1,
     )
     parser.add_argument(
-        "-ang_err",
+        "-sigma",
         type=float,
         help="The angular error (in deg). Default is 0.8, corresponding to the median value from the 10y NT MC",
         default=0.8,
@@ -802,22 +809,27 @@ if __name__ == "__main__":
         default=1.0,
     )
     parser.add_argument(
-        "-ns_bounds",
-        type=Tuple[float, float],
-        help="Bounds for the ns passed in the minimizer. Default is (0, 1000)",
-        default=(0.0, 1e3),
-    )
-    parser.add_argument(
         "-ntrials",
         type=int,
         help="Number of trials to perform. Default is 1",
         default=1,
     )
     parser.add_argument(
+        "-only_bkg",
+        type=ast.literal_eval,
+        help="Do you want to run background-only trials?",
+        default=False,
+    )
+    parser.add_argument(
         "-save_path",
         type=str,
         required=True,
         help="Path where you want to save the results",
+    )
+    parser.add_argument(
+        "-sfx",
+        type=str,
+        help="Suffix for the results file name",
     )
 
     args = parser.parse_args()
@@ -827,30 +839,40 @@ if __name__ == "__main__":
         nsources=args.nsrcs, min_dec=-args.dec_band, max_dec=args.dec_band
     )
     all_ns, all_TS = [], []
-    for _ in range(args.ntrials):
+    for i in range(args.ntrials):
         # for each trial make new dataset
         data = SimulateDataset(
             src_pop=srcs,
             smax=args.smax,
             identical=args.identical_fluxes,
-            n_atm=args.natm,
-            astro_fraction=args.astro_fraction,
+            ntotal=args.N,
+            astro_fraction=args.fastro,
             gamma=args.gamma,
             dnds_index=args.flux_index,
             gamma_bkg=args.gamma_bkg,
             min_e=args.min_e,
             max_e=args.max_e,
             e_bins=args.bins,
+            ang_error=args.sigma,
+            bkg_only=args.only_bkg,
         )
 
         # perform analysis for this dataset
-        llh = LLH(data, srcs)
-        ana = Analysis(llh)
+        llh = LLH(data, srcs, args.sigma, args.sig_spat_thresh)
+        ana = Analysis(llh, args.ns_seed)
         ns, ts = ana.find_total_ns()
         all_ns.append(ns)
         all_TS.append(ts)
 
     # save results in a pickle file at the provided path
-    filepath = os.path.join(args.save_path, "results.pkl")
+    if args.save_path == ".":
+        savepath = os.getcwd()
+    else:
+        savepath = args.save_path
+    if args.sfx is not None:
+        sfx = "_" + args.sfx
+    else:
+        sfx = ""
+    filepath = os.path.join(savepath, "results" + sfx + ".pkl")
     with open(filepath, "wb") as f:
         pickle.dump([all_ns, all_TS], f)
