@@ -129,6 +129,10 @@ class SimulateDataset:
         smax (float): maximum neutrino flux in the population.
                 Corresponds to the flux (here number of neutrinos)
                 the brightest source in the population has. Default is 5
+        scale (float, optional): the signal injection scale.
+                This scales up or down the number of signal events in the dataset.
+                Defaults to 1 for the "true" number of signal events
+                (ie what you expect + Poisson noise)
         gamma (float, optional): spectral index for neutrino production model.
                 Assume that all sources in the population produce neutrinos
                 according to E**gamma power law, where E is the neutrino energy.
@@ -153,6 +157,7 @@ class SimulateDataset:
         ntotal: int,
         smax: float = 5,
         identical: bool = False,
+        scale: float = 1.0,
         astro_fraction: float = 0.2,
         gamma: float = -1.9,
         dnds_index: float = -2.5,
@@ -173,6 +178,7 @@ class SimulateDataset:
         self.angular_error = np.deg2rad(ang_error)
         self.Smax = smax
         self.identical_flux = identical
+        self.scale = scale
         self.gamma = gamma
         self.flux_index = dnds_index
         self.gamma_atm = gamma_bkg[0]
@@ -354,7 +360,9 @@ class SimulateDataset:
                     - 10 ** (self.energy_bins[i] * g1)
                 )
             )
-            self.sig_events_per_bin[:, i] = np.random.poisson(sig_flux_per_bin[:, i])
+            self.sig_events_per_bin[:, i] = np.random.poisson(
+                sig_flux_per_bin[:, i] * self.scale
+            )
 
         # self.all_sig_events_per_src = self.sig_events_per_bin.sum(1)
 
@@ -749,6 +757,9 @@ if __name__ == "__main__":
         default=False,
     )
     parser.add_argument(
+        "-scale", type=float, default=1.0, help="Scale for signal injection"
+    )
+    parser.add_argument(
         "-flux_index",
         type=float,
         help="The index for the sources' flux distribution. Default is -2.5, corresponding to S^(-5/2) distribution",
@@ -823,13 +834,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "-save_path",
         type=str,
-        required=True,
+        default=".",
         help="Path where you want to save the results",
     )
     parser.add_argument(
         "-sfx",
         type=str,
         help="Suffix for the results file name",
+    )
+    parser.add_argument(
+        "-rm_res",
+        type=ast.literal_eval,
+        default=False,
+        help="Do you want to remove old results?",
     )
 
     args = parser.parse_args()
@@ -839,12 +856,15 @@ if __name__ == "__main__":
         nsources=args.nsrcs, min_dec=-args.dec_band, max_dec=args.dec_band
     )
     all_ns, all_TS = [], []
+    results = dict()
     for i in range(args.ntrials):
+        print(f"in trial {i}")
         # for each trial make new dataset
         data = SimulateDataset(
             src_pop=srcs,
             smax=args.smax,
             identical=args.identical_fluxes,
+            scale=args.scale,
             ntotal=args.N,
             astro_fraction=args.fastro,
             gamma=args.gamma,
@@ -874,5 +894,24 @@ if __name__ == "__main__":
     else:
         sfx = ""
     filepath = os.path.join(savepath, "results" + sfx + ".pkl")
+
+    if os.path.isfile(filepath) and args.rm_res:
+        print(f"Removing results file at {filepath}")
+        os.remove(filepath)
+
+    results[args.scale] = {}
+
+    # if you want to update results with new trials
+    if os.path.isfile(filepath) and not args.rm_res:
+        print(f"Updating results at {filepath} with new trials")
+        with open(filepath, "rb") as f:
+            res = pickle.load(f)
+        res[args.scale]["ns"].extend(all_ns)
+        res[args.scale]["TS"].extend(all_TS)
+        results = res
+    else:
+        results[args.scale]["ns"] = all_ns
+        results[args.scale]["TS"] = all_TS
+
     with open(filepath, "wb") as f:
-        pickle.dump([all_ns, all_TS], f)
+        pickle.dump(results, f)
