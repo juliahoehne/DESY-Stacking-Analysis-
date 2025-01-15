@@ -1,25 +1,58 @@
 #!/usr/bin/env python
 
 """"
-This is an example script for running the full analysis for 1 source and a single energy bin.
-You need to simulate the dataset, ie the number of total events, and the source(s) position(s)
-in order to formulate the llh. When you create the llh and subsequently the TS, you need to
-minimize the TS wrt the number of signal events n_s, in order to find the best-fit ns.
-You do this many times to find the TS distribution,
-each time with a different dataset (background RA are randomly selected each time)
+This is an example script for running the full analysis
+for a source population and N events in the dataset
+for n energy bins.
 
-For this energy bin, you first simulate the background events n_bkg,
-for 2 different spectral indices and a uniform RA & DEC. For the same energy range,
-you also simulate the signal events n_sig: for a source at a given position that is drawn from
-uniform RA & DEC distributions, its neutrino flux follows an .
-If you have many sources, then their E^(-gamma) neutrino fluxes , which 
-identical (ie same flux for all), or varying emission (ie randomly assign flux).
-For both the background & signal, you convert from fluxes to number of events
-by adding Poisson noise, so then you end up with a dataset of N = n_bkg + n_sig events.
-Now for each event in the dataset you assign RA & DEC drawn from Gaussian distributions,
-and you select the spatially coincident events for each source which you use to
-calculate the pdfs in the llh. You then minimize the llh with respect to the signal
+For the source population, we simulate the sources' positions
+in (DEC, RA) by drawing from a uniform distribution
+(in a chosen DEC band).
 
+The dataset is simulated wrt the number of signal events,
+namely the total number of injected signal events is what defines
+the number of background events in the dataset.
+The sources' neutrino fluxes follow a power law, so by
+having the expected fluxes we can calculate the
+expected number of signal neutrinos per energy bin per source,
+assuming a power-law energy spectrum.
+Adding Poisson noise gives the injected number of signal events
+which we use to simulate the dataset. Including a scale factor,
+we can scale up or down the number of expected signal around which 
+the Poisson distribution is created for the injected signal.
+The number of expected and injected background events
+(ie astrophysical & atmospheric) is calculated from their
+respective power-law energy spectra.
+
+For the signal events, their positions are simulated by
+first drawing from a Gaussian distribution and simulating
+mock true positions, which we then rotate to match the
+sources positions. For the background events, the
+positions are uniformly drawn and within the same DEC band
+as for the sources.
+
+The signal and background llhs have only the spatial terms,
+so that their ratio, which defines the TS value, is calculated per energy bin.
+The signal spatial pdf is a Gaussian that depends on the 
+opening angles between the events and source's positions,
+while the background spatial pdf is a uniform distribution.
+The TS is a function of ns, ie number of signal events,
+which you minimize to find the ns value that best fits the
+dataset, and calculate the TS for this best-fit ns.
+The minimization is done separately per energy bin,
+so the best-fit ns (TS) are summed together to give us the 
+total/final best-fit ns (TS) for the full energy range.
+You do this many times (ie trials) to find a TS distribution,
+where each time a different dataset is created for the 
+same source population.
+
+For each trial, the expected & injected number of signal events,
+as well as the total best-fit ns and TS are saved in a file. 
+Trials can be run in one go or in batches, so that
+the results from each batch are appended in the file.
+In case of batch trials, the source population should be
+first saved and then loaded for each batch in order to
+ensure that all the trials are for the same sources. 
 """
 
 import os, argparse, ast, pickle
@@ -493,9 +526,9 @@ class LLH:
     Construct the llh to minimize.
 
     The signal and background pdfs have only the spatial terms,
-    where the signal spatial pdf is a 2D Gaussian that depends on the opening angle
+    where the signal spatial pdf is a Gaussian that depends only on the opening angle
     (ie angular distance between simulated events and source positions)
-    and the angular error that is fixed, while the background pdf
+    since the angular error is fixed, while the background pdf
     is just a uniform distribution of the events positions.
     In this implementation, we use the full dataset
     to calculate the opening angles for each source.
@@ -875,6 +908,18 @@ if __name__ == "__main__":
         default=False,
     )
     parser.add_argument(
+        "-load_srcs",
+        type=ast.literal_eval,
+        help="Do you want to load the source population?",
+        default=False,
+    )
+    parser.add_argument(
+        "-save_srcs",
+        type=ast.literal_eval,
+        help="Do you want to save the source population?",
+        default=False,
+    )
+    parser.add_argument(
         "-save_path",
         type=str,
         default=".",
@@ -894,10 +939,35 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.save_path == ".":
+        savepath = os.getcwd()
+    else:
+        savepath = args.save_path
+    if args.sfx is not None:
+        sfx = "_" + args.sfx
+    else:
+        sfx = ""
+
+    src_path = os.path.join(savepath, "src_pop" + sfx + ".pkl")
+    res_path = os.path.join(savepath, "results" + sfx + ".pkl")
+
+    if os.path.isfile(res_path) and not args.rm_res and not args.load_srcs:
+        raise ValueError(
+            "When adding trials you need to load the same source population"
+        )
+
     # simulate the srcs outside the loop so their positions don't change
     srcs = SimulateSources(
         nsources=args.nsrcs, min_dec=-args.dec_band, max_dec=args.dec_band
     )
+    if args.save_srcs:
+        with open(src_path, "wb") as sp:
+            pickle.dump(srcs, sp)
+    if args.load_srcs:
+        assert os.path.isfile(src_path)
+        with open(src_path, "rb") as sf:
+            srcs = pickle.load(sf)
+
     all_ns, all_TS, n_inj, n_exp = [], [], [], []
     results = {args.scale: {}}
     for i in range(args.ntrials):
@@ -930,36 +1000,27 @@ if __name__ == "__main__":
         all_ns.append(ns)
         all_TS.append(ts)
 
-    # save results in a pickle file at the provided path
-    if args.save_path == ".":
-        savepath = os.getcwd()
-    else:
-        savepath = args.save_path
-    if args.sfx is not None:
-        sfx = "_" + args.sfx
-    else:
-        sfx = ""
-    filepath = os.path.join(savepath, "results" + sfx + ".pkl")
-
-    if os.path.isfile(filepath) and args.rm_res:
-        print(f"Removing results file at {filepath}")
-        os.remove(filepath)
+    # if you ran trials before but you want to remove the results
+    if os.path.isfile(res_path) and args.rm_res:
+        print(f"Removing results file at {res_path}")
+        os.remove(res_path)
 
     # if you want to update results with new trials
-    if os.path.isfile(filepath) and not args.rm_res:
-        print(f"Updating results at {filepath} with new trials")
-        with open(filepath, "rb") as f:
+    if os.path.isfile(res_path) and not args.rm_res:
+        print(f"Updating results at {res_path} with new trials")
+        with open(res_path, "rb") as f:
             res = pickle.load(f)
         res[args.scale]["n_inj"].extend(n_inj)
         res[args.scale]["n_exp"].extend(n_exp)
         res[args.scale]["ns"].extend(all_ns)
         res[args.scale]["TS"].extend(all_TS)
         results = res
+    # if it's the first time you run trials
     else:
         results[args.scale]["n_inj"] = n_inj
         results[args.scale]["n_exp"] = n_exp
         results[args.scale]["ns"] = all_ns
         results[args.scale]["TS"] = all_TS
 
-    with open(filepath, "wb") as f:
+    with open(res_path, "wb") as f:
         pickle.dump(results, f)
