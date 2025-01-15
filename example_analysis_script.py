@@ -191,11 +191,12 @@ class SimulateDataset:
         self.energy_bins = np.linspace(self.min_e, self.max_e, self.nbins + 1)
 
         # create the dataset
-        self.simulate_signal_events()
+        self.calculate_sig()
         self.simulate_bkg_events()
         self.dataset = []
         for i in range(self.nbins):
             if not bkg_only:
+                self.simulate_signal_events()
                 tot_events_per_bin = self.bkg_pos[i] + self.sig_pos[i]
                 self.dataset.append(tot_events_per_bin)
             else:
@@ -321,15 +322,20 @@ class SimulateDataset:
 
         return self.Smax * nsources ** (1.0 / (self.flux_index + 1.0))
 
-    def simulate_signal_events(self) -> None:
+    def calculate_sig(self) -> None:
         """
-        Simulate the signal events according to the neutrino flux per energy bin.
-        First initialize the fluxes, if all sources have identical fluxes or not,
-        and then calculate them for each source following the distribution.
-        For each source, the expected number of signal events per energy bin are estimated
-        wrt the flux, and then drawn from a Poisson distribution.
-        The DEC & RA for these events are randomly drawn from a uniform distribution,
-        where the DEC must be within the source population DEC bandwidth.
+        Estimate the number of expected and injected
+        signal neutrinos per energy bin according to
+        the neutrino flux distribution.
+        First initialize the fluxes,
+        if all sources have identical fluxes or not,
+        and then calculate them for each source
+        following the distribution.
+        For each source, the expected number
+        of signal events per energy bin is estimated
+        wrt the flux, while the injected
+        (ie what is actually simulated) is drawn from a
+        Poisson distribution around the expectation value.
         """
 
         # initialize fluxes
@@ -337,7 +343,7 @@ class SimulateDataset:
             srcs = self.nsrcs * np.ones(self.nsrcs)
         else:
             srcs = self.nsrcs * np.random.rand(self.nsrcs)
-        # calculate source fluxes
+        # calculate sources fluxes
         src_fluxes = self.flux_distribution(srcs)
 
         # calculate number of signal events per energy bin for each source
@@ -368,6 +374,17 @@ class SimulateDataset:
         # self.all_sig_events_per_src = self.sig_events_per_bin.sum(1)
         self.all_sig_events_per_bin = self.inj_sig_per_bin.sum(0)
         self.tot_exp_sig_per_bin = self.exp_sig_per_bin.sum(0)
+
+    def simulate_signal_events(self) -> None:
+        """
+        Simulate the signal events in the dataset.
+        For each src, the positions of n signal events
+        are simulated, where n is the number
+        of injected signal events per bin.
+        The (DEC, RA) for these events are first drawn
+        from a Gaussian distribution and then
+        rotated to match the source's position.
+        """
 
         # simulate signal events positions as in (DEC, RA)
         self.sig_pos = []
@@ -890,7 +907,7 @@ if __name__ == "__main__":
             smax=args.smax,
             identical=args.identical_fluxes,
             scale=args.scale,
-            ntotal=args.N,
+            N=args.N,
             astro_fraction=args.fastro,
             gamma=args.gamma,
             dnds_index=args.flux_index,
@@ -906,7 +923,7 @@ if __name__ == "__main__":
         n_exp.append(sum(data.tot_exp_sig_per_bin))
 
         # perform analysis for this dataset
-        llh = LLH(data, srcs, args.sigma, args.sig_spat_thresh)
+        llh = LLH(data, srcs, args.sig_spat_thresh)
         weights = [data.exp_sig_per_bin[:, i] for i in range(args.bins)]
         ana = Analysis(llh, weights, args.ns_seed, args.bounds)
         ns, ts = ana.find_total_ns()
