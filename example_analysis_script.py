@@ -881,7 +881,7 @@ if __name__ == "__main__":
     srcs = SimulateSources(
         nsources=args.nsrcs, min_dec=-args.dec_band, max_dec=args.dec_band
     )
-    all_ns, all_TS = [], []
+    all_ns, all_TS, n_inj, n_exp = [], [], [], []
     results = {args.scale: {}}
     for i in range(args.ntrials):
         # for each trial make new dataset
@@ -902,8 +902,8 @@ if __name__ == "__main__":
             bkg_only=args.only_bkg,
         )
         # save the number of expected and simulated signal events
-        results[args.scale]["n_inj"] = sum(data.all_sig_events_per_bin)
-        results[args.scale]["n_exp"] = sum(data.tot_exp_sig_per_bin)
+        n_inj.append(sum(data.all_sig_events_per_bin))
+        n_exp.append(sum(data.tot_exp_sig_per_bin))
 
         # perform analysis for this dataset
         llh = LLH(data, srcs, args.sigma, args.sig_spat_thresh)
@@ -933,10 +933,14 @@ if __name__ == "__main__":
         print(f"Updating results at {filepath} with new trials")
         with open(filepath, "rb") as f:
             res = pickle.load(f)
+        res[args.scale]["n_inj"].extend(n_inj)
+        res[args.scale]["n_exp"].extend(n_exp)
         res[args.scale]["ns"].extend(all_ns)
         res[args.scale]["TS"].extend(all_TS)
         results = res
     else:
+        results[args.scale]["n_inj"] = n_inj
+        results[args.scale]["n_exp"] = n_exp
         results[args.scale]["ns"] = all_ns
         results[args.scale]["TS"] = all_TS
 
