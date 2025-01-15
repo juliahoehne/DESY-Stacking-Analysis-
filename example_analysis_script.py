@@ -882,7 +882,7 @@ if __name__ == "__main__":
         nsources=args.nsrcs, min_dec=-args.dec_band, max_dec=args.dec_band
     )
     all_ns, all_TS = [], []
-    results = dict()
+    results = {args.scale: {}}
     for i in range(args.ntrials):
         # for each trial make new dataset
         data = SimulateDataset(
@@ -901,6 +901,9 @@ if __name__ == "__main__":
             ang_error=args.sigma,
             bkg_only=args.only_bkg,
         )
+        # save the number of expected and simulated signal events
+        results[args.scale]["n_inj"] = sum(data.all_sig_events_per_bin)
+        results[args.scale]["n_exp"] = sum(data.tot_exp_sig_per_bin)
 
         # perform analysis for this dataset
         llh = LLH(data, srcs, args.sigma, args.sig_spat_thresh)
@@ -924,8 +927,6 @@ if __name__ == "__main__":
     if os.path.isfile(filepath) and args.rm_res:
         print(f"Removing results file at {filepath}")
         os.remove(filepath)
-
-    results[args.scale] = {}
 
     # if you want to update results with new trials
     if os.path.isfile(filepath) and not args.rm_res:
