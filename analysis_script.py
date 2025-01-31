@@ -793,10 +793,9 @@ class Analysis:
 
 
 if __name__ == "__main__":
-    # configure how you run the script
+  
     parser = argparse.ArgumentParser()
-
-    # make the arguments with which to run the script
+    
     parser.add_argument(
         "-nsrcs",
         type=int,
@@ -992,7 +991,7 @@ if __name__ == "__main__":
             srcs = pickle.load(sf)
 
             
-    # Laden bestehender Ergebnisse (falls vorhanden)
+    # load files if there are already some
     if os.path.isfile(res_path) and not args.rm_res:
         with open(res_path, "rb") as f:
             results = pickle.load(f)
@@ -1000,16 +999,16 @@ if __name__ == "__main__":
         results = {}
 
     if args.only_bkg:
-        scales = [1.0]  # Nur eine Scale verwenden
+        scales = [1.0]  # only use one scale for the background
     else:
         scales = np.linspace(args.scalefactormin, args.scalefactormax, args.nscale)
 
-    # Simulate und Analyse für alle Scales
+    # simulation and analysis for all the scales
     for scale in scales:
         all_ns, all_TS, n_inj, n_exp = [], [], [], []
 
         for i in range(args.ntrials):
-            # Neues Dataset für jeden Trial erstellen
+            # create new dataset for each trial, except the sources
             data = SimulateDataset(
                 src_pop=srcs,
                 smax=args.smax,
@@ -1027,11 +1026,11 @@ if __name__ == "__main__":
                 bkg_only=args.only_bkg,
             )
 
-            # Signal- und erwartete Ereignisse speichern
+            # save data
             n_inj.append(sum(data.all_sig_events_per_bin))
             n_exp.append(sum(data.tot_exp_sig_per_bin))
 
-            # Analyse für dieses Dataset durchführen
+            # analyse the dataset
             llh = LLH(data, srcs, args.sig_spat_thresh)
             weights = [data.exp_sig_per_bin[:, i] for i in range(args.bins)]
             ana = Analysis(llh, weights, args.ns_seed, args.bounds)
@@ -1039,7 +1038,7 @@ if __name__ == "__main__":
             all_ns.append(ns)
             all_TS.append(ts)
 
-        # Speichern der Ergebnisse für die aktuelle Scale
+        # save of the results for all scales
         if scale not in results:
             results[scale] = {"n_inj": [], "n_exp": [], "ns": [], "TS": []}
 
@@ -1048,7 +1047,7 @@ if __name__ == "__main__":
         results[scale]["ns"].extend(all_ns)
         results[scale]["TS"].extend(all_TS)
 
-    # Ergebnisse speichern
+    # save results in a pkl file
     with open(res_path, "wb") as f:
         pickle.dump(results, f)
     print(f"Ergebnisse erfolgreich in {res_path} gespeichert.")
